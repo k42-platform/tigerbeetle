@@ -324,6 +324,7 @@ pub fn ContextType(
                 });
                 return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
+                    else => unreachable,
                 };
             };
             errdefer context.client.deinit(allocator);

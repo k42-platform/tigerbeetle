@@ -394,7 +394,9 @@ const CLIArgs = union(enum) {
         \\
         \\  --addresses=<addresses>
         \\        The addresses of all replicas in the cluster.
-        \\        Accepts a comma-separated list of IPv4/IPv6 addresses with port numbers.
+        \\        The address at index `--replica` must be an IPv4/IPv6 interface with a port.
+        \\        Other addresses accept IPv4/IPv6 addresses or DNS hostnames.
+        \\        DNS hostnames always use the first resolved record.
         \\        The order is significant and must match across all replicas and clients.
         \\        Either the address or port number (but not both) may be omitted,
         \\        in which case a default of {[default_address]s} or {[default_port]d} will be used.
@@ -499,6 +501,7 @@ const lsm_compaction_block_memory_min = lsm_compaction_block_count_min * constan
 /// are properly validated and desugared (e.g, sizes converted to counts where appropriate).
 pub const Command = union(enum) {
     const Addresses = stdx.BoundedArrayType(std.net.Address, constants.members_max);
+    const StartAddresses = stdx.BoundedArrayType(vsr.AddressSpec, constants.members_max);
     const Path = stdx.BoundedArrayType(u8, std.fs.max_path_bytes);
 
     pub const Format = struct {
@@ -521,7 +524,7 @@ pub const Command = union(enum) {
     };
 
     pub const Start = struct {
-        addresses: Addresses,
+        addresses: StartAddresses,
         // true when the value of `--addresses` is exactly `0`. Used to enable "magic zero" mode for
         // testing. We check the raw string rather then the parsed address to prevent triggering
         // this logic by accident.
@@ -860,7 +863,11 @@ fn parse_args_start(start: CLIArgs.Start) Command.Start {
     const TransfersValuesCache = groove_config.transfers.ObjectsCache.Cache;
     const TransfersPendingValuesCache = groove_config.transfers_pending.ObjectsCache.Cache;
 
-    const addresses = parse_addresses(start.addresses, "--addresses", Command.Addresses);
+    const addresses = parse_start_addresses(
+        start.addresses,
+        "--addresses",
+        Command.StartAddresses,
+    );
     const defaults =
         if (start.development) start_defaults_development else start_defaults_production;
 
@@ -1387,6 +1394,50 @@ fn parse_addresses(
     assert(addresses_parsed.len > 0);
     assert(addresses_parsed.len <= result.capacity());
     result.resize(addresses_parsed.len) catch unreachable;
+    return result;
+}
+
+fn parse_start_addresses(
+    raw_addresses: []const u8,
+    comptime flag: []const u8,
+    comptime BoundedArray: type,
+) BoundedArray {
+    comptime assert(std.mem.startsWith(u8, flag, "--"));
+    var result: BoundedArray = .{};
+
+    var index: usize = 0;
+    var comma_iterator = std.mem.splitScalar(u8, raw_addresses, ',');
+    while (comma_iterator.next()) |raw_address| : (index += 1) {
+        if (raw_address.len == 0) {
+            vsr.fatal(.cli, flag ++ ": invalid trailing comma", .{});
+        }
+        if (index >= result.capacity()) {
+            vsr.fatal(.cli, flag ++ ": too many addresses, at most {d} are allowed", .{
+                result.capacity(),
+            });
+        }
+
+        const address_spec = vsr.parse_address_spec(.{
+            .string = raw_address,
+            .port_default = constants.port,
+        }) catch |err| switch (err) {
+            error.AddressHasMoreThanOneColon => {
+                vsr.fatal(.cli, flag ++ ": invalid address with more than one colon", .{});
+            },
+            error.PortOverflow => vsr.fatal(.cli, flag ++ ": port exceeds 65535", .{}),
+            error.PortInvalid => vsr.fatal(.cli, flag ++ ": invalid port", .{}),
+            error.AddressInvalid => {
+                vsr.fatal(.cli, flag ++ ": invalid address", .{});
+            },
+        };
+
+        result.push(address_spec);
+    }
+
+    if (result.empty()) {
+        vsr.fatal(.cli, flag ++ ": invalid trailing comma", .{});
+    }
+
     return result;
 }
 

@@ -882,6 +882,16 @@ test "exponential_backoff_with_jitter" {
 /// * A replica's IP address may be changed without reconfiguration.
 /// This does require that the user specify the same order to all replicas.
 /// The caller owns the memory of the returned slice of addresses.
+pub const DNSAddress = struct {
+    host: []const u8,
+    port: u16,
+};
+
+pub const AddressSpec = union(enum) {
+    address: std.net.Address,
+    dns: DNSAddress,
+};
+
 pub fn parse_addresses(
     raw: []const u8,
     out_buffer: []std.net.Address,
@@ -938,6 +948,68 @@ pub fn parse_address_and_port(
             },
         ) catch unreachable;
     }
+}
+
+pub fn address_has_explicit_port(string: []const u8) bool {
+    if (std.mem.lastIndexOfAny(u8, string, ":.]")) |split| {
+        return string[split] == ':';
+    }
+    return false;
+}
+
+pub fn parse_address_spec(options: struct {
+    string: []const u8,
+    port_default: u16,
+}) !AddressSpec {
+    const address = parse_address_and_port(.{
+        .string = options.string,
+        .port_default = options.port_default,
+    }) catch |err| switch (err) {
+        error.AddressInvalid => {
+            const dns = try parse_dns_address_and_port(.{
+                .string = options.string,
+                .port_default = options.port_default,
+            });
+            return .{ .dns = dns };
+        },
+        else => return err,
+    };
+    return .{ .address = address };
+}
+
+fn parse_dns_address_and_port(options: struct {
+    string: []const u8,
+    port_default: u16,
+}) !DNSAddress {
+    assert(options.string.len > 0);
+    assert(options.port_default > 0);
+
+    if (std.mem.lastIndexOfAny(u8, options.string, ":.]")) |split| {
+        if (options.string[split] == ':') {
+            const host = options.string[0..split];
+            if (host.len == 0) return error.AddressInvalid;
+            if (host[host.len - 1] == ':') return error.AddressHasMoreThanOneColon;
+
+            const port = std.fmt.parseUnsigned(
+                u16,
+                options.string[split + 1 ..],
+                10,
+            ) catch |err| switch (err) {
+                error.Overflow => return error.PortOverflow,
+                error.InvalidCharacter => return error.PortInvalid,
+            };
+
+            return .{ .host = host, .port = port };
+        }
+
+        if (options.string[0] == '[' and options.string[options.string.len - 1] == ']') {
+            return error.AddressInvalid;
+        }
+
+        return .{ .host = options.string, .port = options.port_default };
+    }
+
+    return .{ .host = options.string, .port = options.port_default };
 }
 
 fn parse_address(string: []const u8, port: u16) !std.net.Address {
@@ -1099,6 +1171,46 @@ test "parse_addresses: fuzz" {
             assert(addresses.len <= 3);
         } else |_| {}
     }
+}
+
+test "parse_address_spec" {
+    const literal = try parse_address_spec(.{
+        .string = "127.0.0.1:3000",
+        .port_default = constants.port,
+    });
+    switch (literal) {
+        .address => |address| {
+            try std.testing.expectEqual(@as(u16, 3000), address.getPort());
+        },
+        .dns => unreachable,
+    }
+
+    const dns_with_port = try parse_address_spec(.{
+        .string = "replica-1.example.com:3001",
+        .port_default = constants.port,
+    });
+    switch (dns_with_port) {
+        .address => unreachable,
+        .dns => |dns| {
+            try std.testing.expectEqualStrings("replica-1.example.com", dns.host);
+            try std.testing.expectEqual(@as(u16, 3001), dns.port);
+        },
+    }
+
+    const dns_default_port = try parse_address_spec(.{
+        .string = "replica-2.example.com",
+        .port_default = constants.port,
+    });
+    switch (dns_default_port) {
+        .address => unreachable,
+        .dns => |dns| {
+            try std.testing.expectEqualStrings("replica-2.example.com", dns.host);
+            try std.testing.expectEqual(constants.port, dns.port);
+        },
+    }
+
+    try std.testing.expect(address_has_explicit_port("127.0.0.1:3000"));
+    try std.testing.expect(!address_has_explicit_port("127.0.0.1"));
 }
 
 pub fn sector_floor(offset: u64) u64 {

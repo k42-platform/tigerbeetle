@@ -504,11 +504,34 @@ fn comma_separate_ports(allocator: std.mem.Allocator, ports: []const u16) ![]con
     return out.toOwnedSlice();
 }
 
+fn comma_separate_replica_addresses(allocator: std.mem.Allocator, ports: []const u16) ![]const u8 {
+    assert(ports.len > 0);
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+
+    const writer = out.writer();
+    try writer.print("127.0.0.1:{d}", .{ports[0]});
+    for (ports[1..]) |port| try writer.print(",{d}", .{port});
+
+    return out.toOwnedSlice();
+}
+
 test comma_separate_ports {
     const formatted = try comma_separate_ports(std.testing.allocator, &.{ 3000, 3001, 3002 });
     defer std.testing.allocator.free(formatted);
 
     try std.testing.expectEqualStrings("3000,3001,3002", formatted);
+}
+
+test comma_separate_replica_addresses {
+    const formatted = try comma_separate_replica_addresses(
+        std.testing.allocator,
+        &.{ 3000, 3001, 3002 },
+    );
+    defer std.testing.allocator.free(formatted);
+
+    try std.testing.expectEqualStrings("127.0.0.1:3000,3001,3002", formatted);
 }
 
 const Replica = struct {
@@ -577,8 +600,10 @@ const Replica = struct {
             process.destroy(self.allocator);
         }
 
-        const replica_addresses =
-            try comma_separate_ports(self.allocator, self.replica_ports[0..self.replica_count]);
+        const replica_addresses = try comma_separate_replica_addresses(
+            self.allocator,
+            self.replica_ports[0..self.replica_count],
+        );
         defer self.allocator.free(replica_addresses);
 
         var addresses_buffer: [128]u8 = undefined;

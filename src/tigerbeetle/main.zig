@@ -246,11 +246,16 @@ fn command_start(
     var counting_allocator = vsr.CountingAllocator.init(base_allocator);
     const gpa = counting_allocator.allocator();
 
+    var addresses_resolved = stdx.BoundedArrayType(std.net.Address, constants.members_max){};
+    for (args.addresses.const_slice()) |address_spec| {
+        addresses_resolved.push(resolve_address_spec_or_fatal(address_spec, "--addresses"));
+    }
+
     // TODO Panic if the data file's size is larger that args.storage_size_limit.
     // (Here or in Replica.open()?).
 
     var message_pool = try MessagePool.init(gpa, .{ .replica = .{
-        .members_count = args.addresses.count_as(u8),
+        .members_count = addresses_resolved.count_as(u8),
         .pipeline_requests_limit = args.pipeline_requests_limit,
         .message_bus = .tcp,
     } });
@@ -365,7 +370,8 @@ fn command_start(
                 .aof_recovery = args.aof_recovery,
             },
             .message_bus_options = .{
-                .configuration = args.addresses.const_slice(),
+                .configuration = addresses_resolved.const_slice(),
+                .configuration_address_specs = args.addresses.const_slice(),
                 .io = io,
                 .clients_limit = clients_limit,
                 .trace = tracer,
@@ -511,6 +517,39 @@ fn command_start(
             try io.run_for_ns(constants.tick_ms * std.time.ns_per_ms);
         }
     }
+}
+
+fn resolve_address_spec_or_fatal(
+    address_spec: vsr.AddressSpec,
+    cli_flag: []const u8,
+) std.net.Address {
+    return switch (address_spec) {
+        .address => |address| address,
+        .dns => |dns| {
+            var addresses = std.net.getAddressList(
+                std.heap.page_allocator,
+                dns.host,
+                dns.port,
+            ) catch |err| {
+                vsr.fatal(
+                    .cli,
+                    "{s}: DNS lookup failed for '{s}:{d}': {s}",
+                    .{ cli_flag, dns.host, dns.port, @errorName(err) },
+                );
+            };
+            defer addresses.deinit();
+
+            if (addresses.addrs.len == 0) {
+                vsr.fatal(
+                    .cli,
+                    "{s}: DNS lookup returned no addresses for '{s}:{d}'",
+                    .{ cli_flag, dns.host, dns.port },
+                );
+            }
+
+            return addresses.addrs[0];
+        },
+    };
 }
 
 fn command_reformat(

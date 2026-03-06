@@ -63,6 +63,7 @@ pub fn MessageBusType(comptime IO: type) type {
         /// Map from replica index to the currently active connection for that replica, if any.
         /// The connection for the process replica if any will always be null.
         replicas: []?*Connection,
+        replicas_address_specs: []vsr.AddressSpec,
         replicas_addresses: []Address,
         /// The number of outgoing `connect()` attempts for a given replica:
         /// Reset to zero after a successful `on_connect()`.
@@ -87,6 +88,7 @@ pub fn MessageBusType(comptime IO: type) type {
 
         pub const Options = struct {
             configuration: []const Address,
+            configuration_address_specs: ?[]const vsr.AddressSpec = null,
             io: *IO,
             trace: ?*Tracer,
             clients_limit: ?u32 = null,
@@ -140,9 +142,55 @@ pub fn MessageBusType(comptime IO: type) type {
             errdefer allocator.free(replicas);
             @memset(replicas, null);
 
+            const replicas_address_specs = try allocator.alloc(
+                vsr.AddressSpec,
+                options.configuration.len,
+            );
+            errdefer allocator.free(replicas_address_specs);
+
+            var address_specs_copied: usize = 0;
+            errdefer {
+                for (replicas_address_specs[0..address_specs_copied]) |spec| {
+                    switch (spec) {
+                        .dns => |dns| allocator.free(dns.host),
+                        .address => {},
+                    }
+                }
+            }
+
+            if (options.configuration_address_specs) |specs| {
+                assert(specs.len == options.configuration.len);
+                for (specs, replicas_address_specs) |source, *target| {
+                    target.* = switch (source) {
+                        .address => |address| .{ .address = address },
+                        .dns => |dns| .{ .dns = .{
+                            .host = try allocator.dupe(u8, dns.host),
+                            .port = dns.port,
+                        } },
+                    };
+                    address_specs_copied += 1;
+                }
+            } else {
+                for (options.configuration, replicas_address_specs) |address, *target| {
+                    target.* = .{ .address = address };
+                    address_specs_copied += 1;
+                }
+            }
+
             const replicas_addresses = try allocator.alloc(Address, options.configuration.len);
             errdefer allocator.free(replicas_addresses);
-            stdx.copy_disjoint(.exact, Address, replicas_addresses, options.configuration);
+            for (replicas_address_specs, replicas_addresses, 0..) |spec, *target, replica| {
+                target.* = switch (spec) {
+                    .address => |address| address,
+                    .dns => |dns| bus_resolve_dns_address(dns, replica) catch |err| {
+                        log.warn(
+                            "{}: init: failed to resolve '{s}:{d}' for replica={} ({s})",
+                            .{ bus_id(process_id), dns.host, dns.port, replica, @errorName(err) },
+                        );
+                        return err;
+                    },
+                };
+            }
 
             const replicas_connect_attempts = try allocator.alloc(u64, options.configuration.len);
             errdefer allocator.free(replicas_connect_attempts);
@@ -165,6 +213,7 @@ pub fn MessageBusType(comptime IO: type) type {
                 .send_queue_buffer = send_queue_buffer,
                 .connections = connections,
                 .replicas = replicas,
+                .replicas_address_specs = replicas_address_specs,
                 .replicas_addresses = replicas_addresses,
                 .replicas_connect_attempts = replicas_connect_attempts,
                 .prng = stdx.PRNG.from_seed(prng_seed),
@@ -219,6 +268,13 @@ pub fn MessageBusType(comptime IO: type) type {
                 send_queue_buffer_previous.?.ptr + send_queue_buffer_previous.?.len);
 
             allocator.free(bus.replicas_connect_attempts);
+            for (bus.replicas_address_specs) |spec| {
+                switch (spec) {
+                    .dns => |dns| allocator.free(dns.host),
+                    .address => {},
+                }
+            }
+            allocator.free(bus.replicas_address_specs);
             allocator.free(bus.replicas_addresses);
             allocator.free(bus.replicas);
             allocator.free(bus.connections);
@@ -243,10 +299,42 @@ pub fn MessageBusType(comptime IO: type) type {
             });
         }
 
+        fn bus_id(process: ProcessID) u128 {
+            return switch (process) {
+                .replica => |replica| @as(u128, replica),
+                .client => |client| client,
+            };
+        }
+
+        fn bus_resolve_dns_address(dns: vsr.DNSAddress, replica: usize) !Address {
+            var addresses = try std.net.getAddressList(std.heap.page_allocator, dns.host, dns.port);
+            defer addresses.deinit();
+
+            if (addresses.addrs.len == 0) {
+                log.warn(
+                    "{}: connect_to_replica: DNS lookup returned no records for '{s}:{d}'",
+                    .{ replica, dns.host, dns.port },
+                );
+                return error.UnknownHostName;
+            }
+            return addresses.addrs[0];
+        }
+
         pub fn listen(bus: *MessageBus) !void {
             assert(bus.process == .replica);
             assert(bus.accept_fd == null);
             assert(bus.accept_address == null);
+
+            switch (bus.replicas_address_specs[bus.process.replica]) {
+                .address => {},
+                .dns => |dns| {
+                    log.err(
+                        "{}: listen: local replica address must be IPv4/IPv6, not DNS ('{s}:{d}')",
+                        .{ bus.id, dns.host, dns.port },
+                    );
+                    return error.AddressInvalid;
+                },
+            }
 
             const address = bus.replicas_addresses[bus.process.replica];
             const fd = try init_tcp(bus.io, .replica, address.any.family);
@@ -442,15 +530,6 @@ pub fn MessageBusType(comptime IO: type) type {
 
             assert(connection.state == .free);
             assert(connection.fd == null);
-
-            const family = bus.replicas_addresses[replica].any.family;
-            connection.fd = init_tcp(bus.io, bus.process, family) catch |err| {
-                log.err("{}: connect_to_replica: init_tcp error={s}", .{
-                    bus.id,
-                    @errorName(err),
-                });
-                return;
-            };
             connection.peer = .{ .replica = replica };
             connection.state = .connecting;
             bus.connections_used += 1;
@@ -508,6 +587,21 @@ pub fn MessageBusType(comptime IO: type) type {
                 connection.peer.replica,
             });
 
+            const connect_address = bus.resolve_replica_address(connection.peer.replica) orelse {
+                bus.connect_fail(connection);
+                return;
+            };
+
+            const family = connect_address.any.family;
+            connection.fd = init_tcp(bus.io, bus.process, family) catch |err| {
+                log.err("{}: connect_to_replica: init_tcp error={s}", .{
+                    bus.id,
+                    @errorName(err),
+                });
+                bus.connect_fail(connection);
+                return;
+            };
+
             assert(!connection.recv_submitted);
             connection.recv_submitted = true;
 
@@ -518,8 +612,49 @@ pub fn MessageBusType(comptime IO: type) type {
                 // We use `recv_completion` for the connection `timeout()` and `connect()` calls
                 &connection.recv_completion,
                 connection.fd.?,
-                bus.replicas_addresses[connection.peer.replica],
+                connect_address,
             );
+        }
+
+        fn resolve_replica_address(bus: *MessageBus, replica: u8) ?Address {
+            assert(replica < bus.replicas_address_specs.len);
+
+            const address = switch (bus.replicas_address_specs[replica]) {
+                .address => |address| address,
+                .dns => |dns| bus_resolve_dns_address(dns, replica) catch |err| {
+                    log.warn(
+                        "{}: connect_to_replica: DNS lookup failed for '{s}:{d}' (to={}): {s}",
+                        .{ bus.id, dns.host, dns.port, replica, @errorName(err) },
+                    );
+                    return null;
+                },
+            };
+            bus.replicas_addresses[replica] = address;
+            return address;
+        }
+
+        fn connect_fail(bus: *MessageBus, connection: *Connection) void {
+            assert(connection.state == .connecting);
+            assert(connection.peer == .replica);
+            assert(connection.fd == null);
+            assert(!connection.recv_submitted);
+            assert(!connection.send_submitted);
+            assert(connection.recv_buffer == null);
+
+            if (bus.replicas[connection.peer.replica] == connection) {
+                bus.replicas[connection.peer.replica] = null;
+            }
+
+            while (connection.send_queue.pop()) |message| {
+                bus.unref(message);
+            }
+
+            bus.connections_used -= 1;
+            connection.* = .{
+                .send_queue = .{
+                    .buffer = connection.send_queue.buffer,
+                },
+            };
         }
 
         fn connect_callback(
